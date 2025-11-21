@@ -89,8 +89,15 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
                     if os.path.exists(adapter_path):
                         # Get raw prompt_ids using the augmented data
                         raw_prompt_ids = get_train_data(args.augment_model, [aug], tokenizer, args)[0]
+                        
+                        chat_template = getattr(tokenizer, 'chat_template', "")
+                        start_tokens = tokenizer("<|start_header_id|>assistant<|end_header_id|>", add_special_tokens=False)['input_ids']
+                        if "<|start_header_id|>assistant<|end_header_id|>" not in chat_template:
+                            start_tokens = tokenizer("[/INST]", add_special_tokens=False)["input_ids"]
+
                         # Process prompt_ids following encode.py's TrainingData class
                         labels = raw_prompt_ids.copy()
+                        answer_start_idx = -1
                         if len(raw_prompt_ids) > max_length:
                             raw_prompt_ids = raw_prompt_ids[:max_length]
                             labels = labels[:max_length]
@@ -98,6 +105,16 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
                         raw_prompt_ids += [pad_token_id] * (max_length - len(raw_prompt_ids))
                         labels += [ignored_id] * (max_length - len(labels))
                         
+                        for i in range(len(raw_prompt_ids) - len(start_tokens), -1, -1):
+                            if raw_prompt_ids[i:i+len(start_tokens)] == start_tokens:
+                                answer_start_idx = i + len(start_tokens)
+                                break
+                        if answer_start_idx == -1:
+                            print("eorror: not answer token")
+                        else:
+                            for i in range(len(labels)):
+                                if i < answer_start_idx or raw_prompt_ids[i] == pad_token_id:
+                                    labels[i] = ignored_id
                         # extract passage_list
                         is_multi_doc = False if "is_multi_doc" not in aug else aug['is_multi_doc']
                         if is_multi_doc:
