@@ -30,14 +30,31 @@ class TrainingData(Dataset):
         self.max_length = max_length
         self.dataset = []
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        chat_template = getattr(tokenizer, 'chat_template', "")
+        start_tokens = tokenizer("<|start_header_id|>assistant<|end_header_id|>", add_special_tokens=False)['input_ids']
+        if "<|start_header_id|>assistant<|end_header_id|>" not in chat_template:
+            start_tokens = tokenizer("[/INST]", add_special_tokens=False)["input_ids"]
+
         for input_ids in prompt_ids:
             labels = input_ids.copy()
+            answer_start_idx = -1
             if len(input_ids) > max_length:
                 input_ids = input_ids[:max_length]
                 labels = labels[:max_length]
             attention_mask = [1] * len(input_ids) + [0] * (max_length - len(input_ids))
             input_ids += [pad_token_id] * (max_length - len(input_ids))
             labels += [self.ignored_id] * (max_length - len(labels))
+
+            for i in range(len(input_ids) - len(start_tokens), -1, -1):
+                if input_ids[i:i+len(start_tokens)] == start_tokens:
+                    answer_start_idx = i + len(start_tokens)
+                    break
+            if answer_start_idx == -1:
+                print("[WARN] 未找到answer起始标记，所有标签设为-100（不计算loss）")
+            else:
+                for i in range(len(labels)):
+                    if i < answer_start_idx or input_ids[i] == pad_token_id:
+                        labels[i] = self.ignored_id
             self.dataset.append({
                 "input_ids": input_ids,
                 "labels": labels,
