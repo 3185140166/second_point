@@ -10,7 +10,7 @@ import time
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 import prompt_template
 from root_dir_path import ROOT_DIR
-from utils import get_model, evaluate, predict, load_data, read_complete, get_attributes, delta_inject, delta_remove, get_embedding_model
+from utils import get_model, evaluate, predict, load_data, read_complete, get_attributes, delta_inject, delta_remove, get_embedding_model, embedding_encode
 from encode import get_train_data
 from projector import ParameterTranslator
 from transformers import DefaultDataCollator, AutoTokenizer, AutoModel
@@ -139,7 +139,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
     return all_training_samples
 
 class TrainingDataCollator(DefaultDataCollator):
-    def __init__(self, tokenizer, device, model, fusion_network, use_fusion, embedding_model, embedding_tokenizer, embedding_device):
+    def __init__(self, tokenizer, device, model, fusion_network, use_fusion, embedding_model, embedding_tokenizer, embedding_device, embedding_dim):
         super().__init__()
         self.tokenizer = tokenizer
         self.device = device
@@ -149,6 +149,7 @@ class TrainingDataCollator(DefaultDataCollator):
         self.embedding_model = embedding_model
         self.embedding_tokenizer = embedding_tokenizer
         self.embedding_device = embedding_device
+        self.embedding_dim = embedding_dim
     
     def __call__(self, examples: List[Dict[str, dict]]) -> Dict[str, torch.Tensor]:
         input_embeds = []
@@ -176,21 +177,14 @@ class TrainingDataCollator(DefaultDataCollator):
                 # ===============================分别编码每个文档==================================
                 passage_embeddings = []
                 for passage in passages_list:
-                    with torch.no_grad():
-                        emb_tokens = self.embedding_tokenizer(
-                            passage,
-                            return_tensors='pt',
-                            truncation=True,
-                            padding=True,
-                            max_length=3000
-                        )
-                    emb_tokens = {k: v.to(self.embedding_device) for k, v in emb_tokens.items()}
-                    emb_out = self.embedding_model(**emb_tokens)
-                    if hasattr(emb_out, "pooler_output"):
-                        passage_embedding = emb_out.pooler_output  # [1, 2048]
-                    else:
-                        passage_embedding = emb_out.last_hidden_state.mean(dim=1)  # [1, 2048]
-                    passage_embeddings.append(passage_embedding)
+                    emb = embedding_encode(
+                        passage,
+                        self.embedding_model,
+                        self.embedding_tokenizer,
+                        device=self.embedding_device,
+                        dim=self.embedding_dim
+                    )
+                    passage_embeddings.append(emb)
                 # ============融合，self-attention============
                 if self.use_fusion:
                     if len(passage_embeddings)>1:
@@ -252,6 +246,9 @@ def main(args):
     )
     # Convert to PeftModel
     model = get_peft_model(base_model, peft_config)
+
+    # align with base model
+    embedding_dim = model.config.hidden_size
     # Prepare training data from all datasets
     training_samples = prepare_training_data_multi_datasets(args, tokenizer, datasets)
     dataset = create_lora_passage_dataset(training_samples)
@@ -274,15 +271,15 @@ def main(args):
         shuffle=True, 
         collate_fn=TrainingDataCollator(
             tokenizer, device, model, fusion_network=fusion_net, use_fusion=use_fusion,
-            embedding_model=embedding_model, embedding_tokenizer=embedding_tokenizer, embedding_device=device_projector)
+            embedding_model=embedding_model, embedding_tokenizer=embedding_tokenizer, embedding_device=device_projector, embedding_dim=embedding_dim)
     )
     print(f"initialize projector with {args.projector_p} hidden layers")
     # Initialize projector
     projector = ParameterTranslator(
         ["down_proj", "up_proj", "gate_proj"],
         list(range(model.config.num_hidden_layers)),
-        # model.config.hidden_size,
-        embedding_model.config.hidden_size, # 改成 embedding_model 输出维度（如2560）
+        model.config.hidden_size,
+        # embedding_model.config.hidden_size, # 改成 embedding_model 输出维度（如2560）
         model.config.intermediate_size,
         args.lora_rank,
         args.projector_p,
