@@ -206,6 +206,15 @@ def get_model(model_name, max_new_tokens=20):
     )
     return model, tokenizer, generation_config
 
+### new
+def get_embedding_model(model_name, output_dim=None, device="cpu"):
+    model_path = get_model_path(model_name)
+    # 这里建议用 AutoModel，如果官方有更专门的 embedding 类用那个
+    tokenizer = AutoTokenizer.from_pretrained(model_path,trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+    model.eval()
+    model.to(device)
+    return model, tokenizer
 # -------------------------------- for augmentation ----------------------------------------
 
 def model_generate(prompt, model, tokenizer, generation_config):
