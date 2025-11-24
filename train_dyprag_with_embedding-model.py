@@ -190,7 +190,7 @@ class TrainingDataCollator(DefaultDataCollator):
                         passage_embedding = emb_out.pooler_output  # [1, 2048]
                     else:
                         passage_embedding = emb_out.last_hidden_state.mean(dim=1)  # [1, 2048]
-                    passage_embeddings.append(passage_embedding.to(self.fusion_network.device))
+                    passage_embeddings.append(passage_embedding)
                 # ============融合，self-attention============
                 if self.use_fusion:
                     if len(passage_embeddings)>1:
