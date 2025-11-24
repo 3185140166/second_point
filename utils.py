@@ -10,11 +10,13 @@ import numpy as np
 import torch.nn as nn
 from collections import Counter
 from typing import List, Union
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModel
 from models.modeling_qwen2 import Qwen2ForCausalLM
 from models.modeling_llama import LlamaForCausalLM
 from root_dir_path import ROOT_DIR
 from prompt_template import get_prompt
+from model_paths import MODEL_PATHS
+import torch.nn.functional as F
 
 DATA_ROOT_DIR = os.path.join(ROOT_DIR, "data_aug")
 
@@ -146,21 +148,7 @@ def load_data(data_name, data_type, model_name, projector=False, data_dir=None):
     
 
 def get_model_path(model_name):
-    # path = ""
-    path1 = "/public/home/mhli/pre_model/meta-llama/Llama3-"
-    path2 = "/public/home/mhli/pre_model/meta-llama/"
-    path3 = "/public/home/mhli/pre_model/meta-llama/Llama-3.2-1B-Instruct" # Your local path to the model
-    if model_name == "llama3-8b-instruct": 
-        # return path + "Meta-Llama-3-8B-Instruct"
-        return path1
-    elif model_name == "qwen2.5-1.5b-instruct":
-        # return path + "Qwen2.5-1.5B-Instruct"
-        return path2
-    elif model_name == "llama3.2-1b-instruct":
-        # return path + "Llama-3.2-1B-Instruct"
-        return path3
-    else:
-        return model_name
+    return MODEL_PATHS.get(model_name, model_name)
 
 def get_attributes(x: nn.Module, attributes: str):
     """
@@ -206,8 +194,8 @@ def get_model(model_name, max_new_tokens=20):
     )
     return model, tokenizer, generation_config
 
-### new
-def get_embedding_model(model_name, output_dim=None, device="cpu"):
+#---------------------------------- embedding model------------------------------------------
+def get_embedding_model(model_name, device="cpu"):
     model_path = get_model_path(model_name)
     # 这里建议用 AutoModel，如果官方有更专门的 embedding 类用那个
     tokenizer = AutoTokenizer.from_pretrained(model_path,trust_remote_code=True)
@@ -215,6 +203,31 @@ def get_embedding_model(model_name, output_dim=None, device="cpu"):
     model.eval()
     model.to(device)
     return model, tokenizer
+
+def embedding_encode(texts, model, tokenizer, device='cpu', dim=None, max_length=1500, is_query=False, instruction=False):
+    if isinstance(texts, str):
+        texts = [texts]
+    if is_query and instruction is not None:
+        texts = [f"Instruct: {instruction}\nQuery:{x}" for x in texts]
+    batch = tokenizer(
+        texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    batch = {k: v.to(device) for k, v in batch.items()}
+    with torch.no_grad():
+        outputs = model(**batch)
+        last_hidden = outputs.last_hidden_state
+        # last_token_pool官方推荐
+        sequence_lengths = batch["attention_mask"].sum(dim=1) - 1
+        pooled = last_hidden[torch.arange(len(texts), device=device), sequence_lengths]
+        if dim is not None:
+            pooled = pooled[:, :dim]
+        pooled = F.normalize(pooled, p=2, dim=1)
+        return pooled
+
 # -------------------------------- for augmentation ----------------------------------------
 
 def model_generate(prompt, model, tokenizer, generation_config):
