@@ -46,7 +46,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
     """
     all_training_samples = []
     ignored_id = -100
-    max_length = 3000
+    max_length = 1500
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     
     for dataset_name in datasets:
@@ -173,7 +173,7 @@ class TrainingDataCollator(DefaultDataCollator):
                 """
 
                 passages_list = example['passages']
-
+                fusion_device = get_device(self.fusion_network)
                 # ===============================分别编码每个文档==================================
                 passage_embeddings = []
                 for passage in passages_list:
@@ -183,7 +183,7 @@ class TrainingDataCollator(DefaultDataCollator):
                         self.embedding_tokenizer,
                         device=self.embedding_device,
                         dim=self.embedding_dim
-                    )
+                    ).to(fusion_device)
                     passage_embeddings.append(emb)
                 # ============融合，self-attention============
                 if self.use_fusion:
@@ -232,7 +232,7 @@ def main(args):
 
     # embedding model
     embedding_model_name = "Qwen3-Embedding-4B"
-    embedding_model, embedding_tokenizer = get_embedding_model(embedding_model_name, device=device_projector)
+    embedding_model, embedding_tokenizer = get_embedding_model(embedding_model_name, device=device)
     tokenizer.pad_token = tokenizer.eos_token
     
     # Create base LoRA config
@@ -271,7 +271,7 @@ def main(args):
         shuffle=True, 
         collate_fn=TrainingDataCollator(
             tokenizer, device, model, fusion_network=fusion_net, use_fusion=use_fusion,
-            embedding_model=embedding_model, embedding_tokenizer=embedding_tokenizer, embedding_device=device_projector, embedding_dim=embedding_dim)
+            embedding_model=embedding_model, embedding_tokenizer=embedding_tokenizer, embedding_device=device, embedding_dim=embedding_dim)
     )
     print(f"initialize projector with {args.projector_p} hidden layers")
     # Initialize projector
