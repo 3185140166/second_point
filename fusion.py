@@ -71,65 +71,54 @@ class EmbeddingFusion(nn.Module):
 
 class CrossAttentionFusion(nn.Module):
     """
-    跨文档注意力融合（适合2-3个文档）
+    融合问题embedding和多段passage embedding的交叉注意力模块
     """
-    def __init__(self, hidden_dim, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        # 对每个文档分别做attention
-        self.cross_attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=8,
-                dropout=dropout,
-                batch_first=True
-            )
-            for _ in range(3)  # 支持最多3个文档
-        ])
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.layer_norm1 = nn.LayerNorm(hidden_dim)
+        self.dropout1 = nn.Dropout(dropout)
         
-        # 最后的融合层
-        self.fusion_linear = nn.Linear(hidden_dim * 3, hidden_dim)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-    
-    def forward(self, doc_embeddings):
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim)
+        )
+        self.layer_norm2 = nn.LayerNorm(hidden_dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, question_embedding, passage_embeddings):
         """
         Args:
-            doc_embeddings: list of (batch, hidden_dim) tensors
-        
+            question_embedding: (batch, 1, hidden_dim)
+            passage_embeddings: (batch, num_passages, hidden_dim)
+
         Returns:
             fused_embedding: (batch, hidden_dim)
         """
-        if len(doc_embeddings) == 1:
-            return doc_embeddings[0]
+        # 交叉注意力 (Q=question, K,V=passages)
+        attn_output, attn_weights = self.cross_attention(
+            query=question_embedding,         # (batch, 1, hidden_dim)
+            key=passage_embeddings,           # (batch, num_passages, hidden_dim)
+            value=passage_embeddings          # (batch, num_passages, hidden_dim)
+        )
+        # 残差连接 + LayerNorm
+        x = self.layer_norm1(question_embedding + self.dropout1(attn_output))  # shape (batch, 1, hidden_dim)
         
-        # 对每个文档进行交叉注意力
-        outputs = []
-        for i, doc_emb in enumerate(doc_embeddings):
-            # 以当前文档为query，其他所有文档为key/value
-            other_docs = torch.cat(
-                [doc_embeddings[j] for j in range(len(doc_embeddings)) if j != i],
-                dim=0
-            )  # (num_other_docs, hidden_dim)
-            
-            # 扩展维度用于attention
-            doc_emb_expanded = doc_emb.unsqueeze(1)  # (batch, 1, hidden_dim)
-            other_docs_expanded = other_docs.unsqueeze(0).expand(doc_emb.shape[0], -1, -1)
-            
-            # 交叉注意力
-            attn_out, _ = self.cross_attention_layers[i](
-                doc_emb_expanded, 
-                other_docs_expanded, 
-                other_docs_expanded
-            )
-            
-            outputs.append(attn_out.squeeze(1))  # (batch, hidden_dim)
-        
-        # 拼接所有输出
-        concatenated = torch.cat(outputs, dim=-1)  # (batch, hidden_dim * num_docs)
-        
-        # 融合
-        fused = self.fusion_linear(concatenated)
-        fused = self.layer_norm(fused)
-        
-        return fused
+        # 去掉长度1维度 => (batch, hidden_dim)
+        x = x.squeeze(1)
+        # MLP融合，残差 + LayerNorm
+        mlp_out = self.mlp(x)
+        x = self.layer_norm2(x + self.dropout2(mlp_out))
+
+        # x.shape = (batch, hidden_dim)
+        return x
+
