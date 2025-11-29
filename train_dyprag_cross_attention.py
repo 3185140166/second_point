@@ -46,7 +46,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
     """
     all_training_samples = []
     ignored_id = -100
-    max_length = 2048
+    max_length = 3000
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     
     for dataset_name in datasets:
@@ -55,7 +55,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
         args.dataset = dataset_name
         if dataset_name in ("2wikimultihopqa", "hotpotqa"):
             prompt_template.get_fewshot(dataset_name)
-            args.with_cot = True
+            args.with_cot = True  #这里是不是应该也不要呢？
         else:
             args.with_cot = False
         if dataset_name == "popqa":
@@ -74,6 +74,8 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
                 data = fulldata[test_id]
                 augment = data["augment"] 
                 for pid, aug in enumerate(augment):
+                    if pid < 3:
+                        continue
                     adapter_path = os.path.join(
                         ROOT_DIR, 
                         "offline", 
@@ -91,14 +93,8 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
                         raw_prompt_ids = get_train_data(args.augment_model, [aug], tokenizer, args)[2]
                         # 第二个样本的问题
                         question = aug[f"{args.augment_model}_qa"][1]['question']
-                        chat_template = getattr(tokenizer, 'chat_template', "")
-                        start_tokens = tokenizer("<|start_header_id|>assistant<|end_header_id|>", add_special_tokens=False)['input_ids']
-                        if "<|start_header_id|>assistant<|end_header_id|>" not in chat_template:
-                            start_tokens = tokenizer("[/INST]", add_special_tokens=False)["input_ids"]
-
                         # Process prompt_ids following encode.py's TrainingData class
                         labels = raw_prompt_ids.copy()
-                        answer_start_idx = -1
                         if len(raw_prompt_ids) > max_length:
                             raw_prompt_ids = raw_prompt_ids[:max_length]
                             labels = labels[:max_length]
@@ -106,16 +102,6 @@ def prepare_training_data_multi_datasets(args, tokenizer, datasets):
                         raw_prompt_ids += [pad_token_id] * (max_length - len(raw_prompt_ids))
                         labels += [ignored_id] * (max_length - len(labels))
                         
-                        for i in range(len(raw_prompt_ids) - len(start_tokens), -1, -1):
-                            if raw_prompt_ids[i:i+len(start_tokens)] == start_tokens:
-                                answer_start_idx = i + len(start_tokens)
-                                break
-                        if answer_start_idx == -1:
-                            print("eorror: not answer token")
-                        else:
-                            for i in range(len(labels)):
-                                if i < answer_start_idx or raw_prompt_ids[i] == pad_token_id:
-                                    labels[i] = ignored_id
                         # extract passage_list
                         is_multi_doc = False if "is_multi_doc" not in aug else aug['is_multi_doc']
                         if is_multi_doc:
@@ -363,7 +349,7 @@ def main(args):
             del outputs, lora_state_dict, lm_origin_outputs, lm_outputs
             torch.cuda.empty_cache()
             print(f"Stage 2: Epoch {epoch}, Step {step}, MSE Loss: {mse_loss.item():.4f}, LM Loss: {lm_loss.item():.4f}, KL Loss: {kl_loss.item():.4f}, Target LM Loss: {lm_origin_loss.item():.4f}")
-        save_dir = os.path.join(ROOT_DIR, "projector", f'{args.model_name}_hidden{args.projector_p}_sample{args.sample_rate}_lr{args.dyprag_learning_rate}_cross_attention')
+        save_dir = os.path.join(ROOT_DIR, "projector", f'{args.model_name}_hidden{args.projector_p}_sample{args.sample_rate}_lr{args.dyprag_learning_rate}_cross_attention_only_multi')
         os.makedirs(save_dir, exist_ok=True)
         print(f"Save projector to {save_dir}")
         # torch.save({'model_state_dict': projector.state_dict()}, os.path.join(save_dir, f'epoch_{epoch}.pt'))
