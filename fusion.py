@@ -2,123 +2,111 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class EmbeddingFusion(nn.Module):
-    """
-    学习如何融合多个文档的embedding
-    支持动态数量的文档
-    """
-    def __init__(self, hidden_dim, num_layers=2, dropout=0.1):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        
-        # 自注意力融合
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # MLP融合层
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim)
-        )
-        
-        self.layer_norm1 = nn.LayerNorm(hidden_dim)
-        self.layer_norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-    
-    def forward(self, doc_embeddings):
-        """
-        Args:
-            doc_embeddings: list of tensors, 每个tensor是 (1, hidden_dim) 或 (batch, hidden_dim)
-        
-        Returns:
-            fused_embedding: (batch, hidden_dim) 或 (1, hidden_dim)
-        """
-        # 堆叠文档embeddings
-        if len(doc_embeddings) == 1:
-            # 单文档，直接返回
-            return doc_embeddings[0]
-        
-        # 多文档：堆叠
-        stacked = torch.cat(doc_embeddings, dim=0)  # (num_docs, hidden_dim)
-        batch_size = doc_embeddings[0].shape[0]
-        stacked = stacked.reshape(batch_size, -1, self.hidden_dim)  # (batch, num_docs, hidden_dim)
-        
-        # 自注意力
-        attn_output, attn_weights = self.self_attention(
-            stacked, stacked, stacked
-        )  # (batch, num_docs, hidden_dim)
-        
-        # 残差连接 + LayerNorm
-        attn_output = self.layer_norm1(stacked + self.dropout(attn_output))
-        
-        # 对所有文档做平均池化
-        fused = attn_output.mean(dim=1)  # (batch, hidden_dim)
-        
-        # MLP
-        mlp_output = self.mlp(fused)
-        
-        # 残差连接 + LayerNorm
-        fused = self.layer_norm2(fused + self.dropout(mlp_output))
-        
-        return fused
-
-
 class CrossAttentionFusion(nn.Module):
     """
-    融合问题embedding和多段passage embedding的交叉注意力模块
+    优化版交叉注意力融合网络
+    适合联合训练和单独训练两种方案，同时支持单文档和多文档处理
+    核心设计：固定2层自注意力+1层交叉注意力，增强文档权重预测
     """
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1, mlp_ratio=2):
         super().__init__()
         self.hidden_dim = hidden_dim
         
-        self.cross_attention = nn.MultiheadAttention(
+        # 1. 固定2层文档自注意力（参考Transformer设计）
+        # 第一层文档自注意力
+        self.doc_self_attn1 = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True
         )
-        self.layer_norm1 = nn.LayerNorm(hidden_dim)
-        self.dropout1 = nn.Dropout(dropout)
+        # 第二层文档自注意力
+        self.doc_self_attn2 = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
         
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
+        # 2. 文档自注意力的LayerNorm和Dropout
+        self.doc_norm1 = nn.LayerNorm(hidden_dim)
+        self.doc_norm2 = nn.LayerNorm(hidden_dim)
+        self.doc_dropout = nn.Dropout(dropout)
+        
+        # 3. 核心交叉注意力层（问题引导的文档融合）
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.cross_norm = nn.LayerNorm(hidden_dim)
+        self.cross_dropout = nn.Dropout(dropout)
+        
+        # 4. 增强版文档权重预测（简化结构，提高效率）
+        self.doc_weight = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim)
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Softmax(dim=1)
         )
-        self.layer_norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout2 = nn.Dropout(dropout)
+        
+        
+        # 5. 优化版MLP（参考Transformer前馈网络设计）
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(hidden_dim * mlp_ratio, hidden_dim)
+        )
+        self.mlp_norm = nn.LayerNorm(hidden_dim)
+        self.mlp_dropout = nn.Dropout(dropout)
+        
 
     def forward(self, question_embedding, passage_embeddings):
         """
         Args:
             question_embedding: (batch, 1, hidden_dim)
             passage_embeddings: (batch, num_passages, hidden_dim)
-
+        
         Returns:
             fused_embedding: (batch, hidden_dim)
         """
-        # 交叉注意力 (Q=question, K,V=passages)
-        attn_output, attn_weights = self.cross_attention(
-            query=question_embedding,         # (batch, 1, hidden_dim)
-            key=passage_embeddings,           # (batch, num_passages, hidden_dim)
-            value=passage_embeddings          # (batch, num_passages, hidden_dim)
-        )
-        # 残差连接 + LayerNorm
-        x = self.layer_norm1(question_embedding + self.dropout1(attn_output))  # shape (batch, 1, hidden_dim)
+        # batch_size, num_passages, hidden_dim = passage_embeddings.shape
         
-        # 去掉长度1维度 => (batch, hidden_dim)
-        x = x.squeeze(1)
-        # MLP融合，残差 + LayerNorm
-        mlp_out = self.mlp(x)
-        x = self.layer_norm2(x + self.dropout2(mlp_out))
-
-        # x.shape = (batch, hidden_dim)
-        return x
-
+        # 多文档情况：固定2层自注意力+1层交叉注意力
+        
+        # 1. 第一层文档自注意力
+        doc_attn_out1, _ = self.doc_self_attn1(
+            passage_embeddings, passage_embeddings, passage_embeddings
+        )
+        passages_enhanced1 = self.doc_norm1(passage_embeddings + self.doc_dropout(doc_attn_out1))
+        
+        # 2. 第二层文档自注意力
+        doc_attn_out2, _ = self.doc_self_attn2(
+            passages_enhanced1, passages_enhanced1, passages_enhanced1
+        )
+        passages_enhanced = self.doc_norm2(passages_enhanced1 + self.doc_dropout(doc_attn_out2))
+        
+        # 3. 文档权重预测：动态学习文档重要性
+        doc_weights = self.doc_weight(passages_enhanced)  # (batch, num_passages, 1)
+        weighted_passages = passages_enhanced * doc_weights  # (batch, num_passages, hidden_dim)
+        
+        # 4. 交叉注意力：问题引导的文档融合
+        cross_attn_out, cross_attn_weights = self.cross_attn(
+            query=question_embedding,  # (batch, 1, hidden_dim)
+            key=weighted_passages,     # (batch, num_passages, hidden_dim)
+            value=weighted_passages    # (batch, num_passages, hidden_dim)
+        )
+        
+        # 5. 残差连接 + LayerNorm
+        question_enhanced = self.cross_norm(question_embedding + self.cross_dropout(cross_attn_out))
+        
+        # 6. 去掉长度维度 => (batch, hidden_dim)
+        fused = question_enhanced.squeeze(1)
+        
+        # 7. MLP融合 + 残差连接
+        mlp_out = self.mlp(fused)
+        fused = self.mlp_norm(fused + self.mlp_dropout(mlp_out))
+        
+        return fused, doc_weights, cross_attn_weights
