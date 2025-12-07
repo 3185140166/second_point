@@ -46,6 +46,94 @@ def create_lora_passage_dataset(lora_passage_pairs):
     
     return LoRAPassageDataset(lora_passage_pairs)
 
+def load_model_checkpoint(fusion_net, projector, checkpoint_path, device):
+    """
+    Load model checkpoint for fusion_net and projector
+    
+    Args:
+        fusion_net: CrossAttentionFusion model to load weights into
+        projector: ParameterTranslator model to load weights into
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load weights onto
+        
+    Returns:
+        fusion_net: Loaded CrossAttentionFusion model
+        projector: Loaded ParameterTranslator model
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load fusion_net weights
+    if 'fusion_net_state_dict' in checkpoint:
+        fusion_net.load_state_dict(checkpoint['fusion_net_state_dict'])
+        print(f"✓ Loaded fusion_net weights from {checkpoint_path}")
+    else:
+        print(f"⚠ No fusion_net_state_dict found in {checkpoint_path}")
+    
+    # Load projector weights
+    if 'projector_state_dict' in checkpoint:
+        projector.load_state_dict(checkpoint['projector_state_dict'])
+        print(f"✓ Loaded projector weights from {checkpoint_path}")
+    else:
+        print(f"⚠ No projector_state_dict found in {checkpoint_path}")
+    
+    return fusion_net, projector
+
+
+def generate_weighted_lora(input_data, tokenizer, model, projector, device, doc_weights, cross_attn_weights=None):
+    """
+    生成加权lora：对每个文档生成lora，然后根据权重进行加权平均
+    
+    Args:
+        input_data: 包含passages_list的输入数据
+        tokenizer: 用于编码文本的分词器
+        model: 用于编码文本的模型
+        projector: 用于生成LoRA的投影器
+        device: 设备
+        doc_weights: 文档权重 (batch_size, num_passages, 1)
+        cross_attn_weights: 交叉注意力权重 (batch_size, num_heads, query_length, key_length)
+                           如果提供，将使用交叉注意力权重进行加权
+    """
+    all_loras = []
+    
+    # 对每个文档生成单独的lora
+    for passage in input_data['passages_list']:
+        # 编码单个文档，得到文档embedding
+        single_passage_emb = encode_text(passage, tokenizer, model, device)
+        
+        # 通过projector生成单个lora
+        with torch.no_grad():
+            single_lora = projector(single_passage_emb.to(device, dtype=torch.float32))
+        
+        all_loras.append(single_lora)
+    
+    # 对多个lora进行加权融合
+    weighted_lora = {}
+    num_docs = len(all_loras)
+    
+    for key in all_loras[0].keys():
+        # 堆叠所有文档的LoRA权重
+        key_loras = torch.stack([lora[key] for lora in all_loras])  # (num_docs, ...)
+        
+        if cross_attn_weights is not None:
+            # 使用交叉注意力权重进行加权
+            # 1. 对注意力头求平均 (batch_size, 1, query_length, key_length)
+            avg_attn_weights = cross_attn_weights.mean(dim=1)  # 对多头注意力求平均
+            # 2. 只使用第一个查询位置的注意力权重 (batch_size, key_length)
+            query_attn_weights = avg_attn_weights.squeeze(1).squeeze(1)  # (batch_size, num_passages)
+            # 3. 确保权重形状正确
+            query_attn_weights = query_attn_weights.squeeze(0)  # (num_passages,)
+            # 4. 归一化注意力权重
+            normalized_weights = F.softmax(query_attn_weights, dim=0)  # 归一化确保权重和为1
+            # 5. 使用交叉注意力权重加权LoRA
+            weighted_lora[key] = torch.sum(normalized_weights[:, None, None] * key_loras, dim=0)
+        else:
+            # 使用原始doc_weights进行加权
+            weights = doc_weights.squeeze(0).squeeze(-1)  # (1, num_passages, 1) -> (num_passages,)
+            weighted_lora[key] = torch.sum(weights[:, None, None] * key_loras, dim=0)
+    
+    return weighted_lora
+
+
 def encode_text(text, tokenizer, model, device):
     """
     backbone
@@ -105,7 +193,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, dataset_path):
 
         # Process prompt_ids following encode.py's TrainingData class
         labels = raw_prompt_ids.copy()
-        answer_start_idx = -1
+        # answer_start_idx = -1
         if len(raw_prompt_ids) > max_length:
             raw_prompt_ids = raw_prompt_ids[:max_length]
             labels = labels[:max_length]
@@ -118,7 +206,7 @@ def prepare_training_data_multi_datasets(args, tokenizer, dataset_path):
                 answer_start_idx = i + len(start_tokens)
                 break
         if answer_start_idx == -1:
-            print("eorror: not answer token")
+            print("error: not answer token")
         else:
             for i in range(len(labels)):
                 if i < answer_start_idx or raw_prompt_ids[i] == pad_token_id:
@@ -176,61 +264,7 @@ class TrainingDataCollator(DefaultDataCollator):
             "model_inputs": model_inputs,
         }
 
-def eval_on_dev(fusion_net, projector, model, tokenizer, dev_dataloader, device, fusion_device, generation_config, args):
-    """dev"""
-    fusion_net.eval()
-    dev_loss = 0.0
-    results = []
-   
-    with torch.no_grad():
-        for batch in tqdm(dev_dataloader, desc="Evaluating"):
-            input_data = batch['input_data'][0]
-            model_inputs = batch['model_inputs'][0]
 
-            q_emb = encode_text(input_data['question'], tokenizer, model, fusion_device).unsqueeze(1)
-            passage_embeddings = []
-            for passage in input_data['passages_list']:
-                passage_embedding = encode_text(passage, tokenizer, model, fusion_device)
-                passage_embeddings.append(passage_embedding)
-            passage_embeddings = torch.cat(passage_embeddings, dim=0).unsqueeze(0)
-            input_embeds, doc_weights, cross_attn_weights = fusion_net(q_emb, passage_embeddings)
-            outputs = projector(input_embeds.to(fusion_device, dtype=torch.float32))
-            outputs = {k: v.to(device) for k, v in outputs.items()}
-            delta_inject(model, outputs)
-            
-            lm_outputs = model(**model_inputs)
-            lm_loss = lm_outputs.loss.to(fusion_device)
-            
-            # 计算完整损失（与训练时一致）
-            weight_reg_loss = -torch.mean(torch.var(doc_weights, dim=1)) * 0.1
-            diversity_loss = torch.mean(torch.sum(cross_attn_weights * torch.log(cross_attn_weights + 1e-10), dim=2)) * 0.05
-            total_loss = lm_loss + weight_reg_loss + diversity_loss
-            
-            dev_loss += total_loss.item()
-            
-            #==================add===================
-            dataset = input_data['dataset']
-            if dataset in loaded_fewshots:
-                prompt_template.fewshot = loaded_fewshots[dataset]
-            text =  predict(model, tokenizer, generation_config, 
-                             input_data['question'], args.with_cot, 
-                             passages=input_data['passages_list'])
-            metrics = evaluate(text, input_data['answer'], args.with_cot)
-            results.append(metrics)
-            
-            delta_remove(model, outputs)
-            del outputs, lm_outputs
-            del input_embeds, doc_weights, cross_attn_weights
-            del lm_loss, weight_reg_loss, diversity_loss, total_loss
-            del q_emb, passage_embeddings
-            torch.cuda.empty_cache()
-        avg_dev_loss = dev_loss / len(dev_dataloader)
-        #===================计算平均指标===================
-    avg_metrics = {}
-    for met in ["em", "f1", "prec", "recall"]:
-        values = [float(r[met]) for r in results if met in r]
-        avg_metrics[met] = round(sum(values) / len(values) if values else 0, 4)
-    return avg_dev_loss, avg_metrics
 
 def main(args):
     # Define datasets to use
@@ -261,11 +295,9 @@ def main(args):
     model = get_peft_model(base_model, peft_config)
     # Prepare training data from all datasets
     samples = prepare_training_data_multi_datasets(args, tokenizer, dataset_path)
-    train_samples, dev_samples = train_test_split(
-        samples, test_size= 0.2, random_state=42
-    )
-    train_dataset = create_lora_passage_dataset(train_samples)
-    dev_dataset = create_lora_passage_dataset(dev_samples)
+    # 不划分数据集，直接使用完整的训练数据，与dyprag的训练策略保持一致
+    train_dataset = create_lora_passage_dataset(samples)
+
 
     fusion_net = CrossAttentionFusion(
         model.config.hidden_size,
@@ -280,12 +312,7 @@ def main(args):
         shuffle=True, 
         collate_fn=TrainingDataCollator(tokenizer, device, model)
     )
-    dev_dataloader = torch.utils.data.DataLoader(
-        dev_dataset,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=TrainingDataCollator(tokenizer, device, model)
-    )
+
     print(f"initialize projector with {args.projector_p} hidden layers")
     # Initialize projector
     projector_path = os.path.join(ROOT_DIR, "projector", args.projector_path, f"epoch_{args.inference_epoch-1}.pt")
@@ -297,20 +324,22 @@ def main(args):
         args.lora_rank,
         args.projector_p,
     ).to(device_projector)
-    projector.load_state_dict(torch.load(projector_path, map_location=model.device)['model_state_dict'])
+    projector.load_state_dict(torch.load(projector_path, map_location=device_projector)['model_state_dict'])
     
+    # 根据joint_training参数决定是否冻结projector
     if args.joint_training:
-        # 联合训练：projector设为train模式，开启梯度更新
+        # 联合训练：projector也参与训练
         projector.train()
         for p in projector.parameters():
             p.requires_grad = True
-        print("Joint training enabled: projector will be trained with learning rate", args.projector_learning_rate)
+        print("✓ Joint training mode: Both fusion_net and projector will be trained")
     else:
-        # 固定projector：设为eval模式，关闭梯度更新
+        # 固定projector：只训练fusion_net
         projector.eval()
         for p in projector.parameters():
             p.requires_grad = False
-        print("Fixed projector: only fusion network will be trained")
+        print("✓ Projector parameters frozen and set to eval mode")
+        print("✓ Only fusion_net will be trained, aligning with average lora")
     
     model.eval()
 
@@ -325,22 +354,6 @@ def main(args):
         # 固定projector：只训练fusion_net
         optimizer = torch.optim.AdamW(fusion_net.parameters(), lr=args.dyprag_learning_rate)
     
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=DYPRAG_TRAIN_EPOCH * len(train_dataloader),
-        eta_min=min(args.dyprag_learning_rate * 0.01, args.projector_learning_rate * 0.01)
-    )
-    # history_train
-    history = {
-        'train_loss': [],
-        'dev_loss': [],
-        'dev_em': [],
-        'dev_f1': [],
-        'dev_prec': [],
-        'dev_recall': []
-    }
-    best_f1 = -float('inf')
-    best_epoch = -1
 
     checkpoint_dir = os.path.join(
         ROOT_DIR, "fusion", 
@@ -373,6 +386,18 @@ def main(args):
             #================================fusion===========================
             input_embeds, doc_weights, cross_attn_weights = fusion_net(q_emb, passage_embeddings)   # (B,hidden_dim), (B, num_passages, 1), (B, 1, num_passages)
             outputs = projector(input_embeds.to(device_projector, dtype=torch.float32))
+            
+            # =================================生成加权平均lora===========================
+            # 使用fusion网络生成的动态文档权重和交叉注意力权重生成加权平均lora
+            weighted_lora = generate_weighted_lora(input_data, tokenizer, model, projector, fusion_device, doc_weights, cross_attn_weights)
+            
+            # =================================计算对齐损失===========================
+            # 对齐损失：fusion_lora与加权平均lora的MSE损失（软约束）
+            mse_loss = torch.tensor(0.0, device=fusion_device, dtype=torch.float32)  
+            for key in outputs.keys():
+                mse_loss += F.mse_loss(outputs[key].to(fusion_device), weighted_lora[key].to(fusion_device))
+            mse_loss *= 100
+            
             # Move outputs to model device before injection
             outputs = {k: v.to(device) for k, v in outputs.items()}
             delta_inject(model, outputs)
@@ -381,105 +406,87 @@ def main(args):
                 # Get language model loss
                 lm_outputs = model(**model_inputs)
                 lm_loss = lm_outputs.loss.to(fusion_device)
+            delta_remove(model, outputs)
+            del outputs
+            # =================================计算输出分布对齐损失（KL散度）===========================
+            # 使用加权lora生成输出分布，作为对齐目标
+            # 对于内容相似的文档，输出分布应该相似
+            with torch.no_grad():
+                # 注入加权lora
+                weighted_outputs = {k: v.to(device) for k, v in weighted_lora.items()}
+                delta_inject(model, weighted_outputs)
+                # 生成输出
+                weighted_lm_outputs = model(**model_inputs)
+                weighted_logits = weighted_lm_outputs.logits
+                # 移除lora
+                delta_remove(model, weighted_outputs)
             
-            # 文档权重正则化损失：鼓励模型学习不同文档的重要性，避免平均化
-            weight_reg_loss = -torch.mean(torch.var(doc_weights, dim=1)) * 0.1
+            # 计算KL散度损失（输出分布对齐）
+            # 只保留输出分布对齐，不约束中间参数
+            kl_loss = F.kl_div(
+                F.log_softmax(lm_outputs.logits, dim=-1),
+                F.softmax(weighted_logits, dim=-1),
+                reduction='batchmean'
+            ).to(fusion_device) * 0.01  # 输出分布对齐权重
             
-            # 多样性正则化损失：鼓励模型关注多个文档，避免过度依赖单一文档
-            diversity_loss = torch.mean(torch.sum(cross_attn_weights * torch.log(cross_attn_weights + 1e-10), dim=2)) * 0.05
+            # =================================计算权重多样性损失===========================
+            # 增加权重多样性损失：鼓励文档权重分布更分散，避免平均
+            #weight_entropy = -torch.sum(doc_weights * torch.log(doc_weights + 1e-10), dim=1).mean()
+            # 提高多样性损失权重，强调权重分散性
+            #diversity_loss = 0.1 * weight_entropy 
             
-            # 总损失
-            total_loss = lm_loss + weight_reg_loss + diversity_loss
+            # 总损失：以语言模型损失为主，辅以输出分布对齐和权重多样性约束
+            # 去掉了MSE损失（中间参数对齐），只保留输出分布对齐
+            total_loss = lm_loss + kl_loss +  mse_loss #+ diversity_loss
             
             # Backward
             total_loss.backward()
 
+            # 只在训练开始时打印少量梯度信息
             if global_step <= 5:
                 for p in fusion_net.parameters():
                     if p.grad is not None:
-                        print("fusion grad norm:", p.grad.norm().item())
+                        print(f"[Debug] Global Step {global_step}: fusion grad norm: {p.grad.norm().item():.6f}")
                         break
                     else:
-                        print("梯度是None")
+                        print(f"[Debug] Global Step {global_step}: No gradients found")
             optimizer.step()
-            scheduler.step()
-            delta_remove(model, outputs)
+            
+            # 更新全局步数
+            global_step += 1
             
             # 先保存所有需要的值，再释放内存
             current_total_loss = total_loss.item()
             current_lm_loss = lm_loss.item()
-            current_weight_reg_loss = weight_reg_loss.item()
-            current_diversity_loss = diversity_loss.item()
+            current_kl_loss = kl_loss.item()
+            # current_diversity_loss = diversity_loss.item()
+            # current_weight_entropy = weight_entropy.item()
+            current_mse_loss =mse_loss.item()
             
             # 释放GPU内存：删除不再需要的变量
-            del outputs, lm_outputs
+            del lm_outputs, weighted_lora, weighted_lm_outputs, weighted_logits
             del input_embeds, doc_weights, cross_attn_weights
-            del lm_loss, weight_reg_loss, diversity_loss, total_loss
+            del lm_loss, kl_loss, total_loss, mse_loss #, diversity_loss
             del q_emb, passage_embeddings
             
             torch.cuda.empty_cache()
-            epoch_loss += current_total_loss
-            global_step += 1
-            if step%10 ==0:
-                print(f"  Step {step}, Total Loss: {current_total_loss:.4f}, LM Loss: {current_lm_loss:.4f}, Weight Reg Loss: {current_weight_reg_loss:.4f}, Diversity Loss: {current_diversity_loss:.4f}")
-        avg_train_loss = epoch_loss / len(train_dataloader)
-        history['train_loss'].append(avg_train_loss)
-        print(f"Epoch {epoch} finished. avg train loss = {avg_train_loss:.4f}")
-        ##============dev===================
-        print("\nValidating...")
-        avg_dev_loss, avg_metrics = eval_on_dev(
-            fusion_net, projector, model, tokenizer,dev_dataloader, 
-            device, fusion_device, generation_config, args
-        )
-        history['dev_loss'].append(avg_dev_loss)
-        history['dev_em'].append(avg_metrics['em'])
-        history['dev_f1'].append(avg_metrics['f1'])
-        history['dev_prec'].append(avg_metrics['prec'])
-        history['dev_recall'].append(avg_metrics['recall'])
-        
-        print(f"\nEpoch {epoch} Dev Results:")
-        print(f"  Loss:   {avg_dev_loss:.4f}")
-        print(f"  EM:     {avg_metrics['em']:.4f}")
-        print(f"  F1:     {avg_metrics['f1']:.4f}")
-        print(f"  Prec:   {avg_metrics['prec']:.4f}")
-        print(f"  Recall: {avg_metrics['recall']:.4f}")
+            print(f"  Step {step}, Total Loss: {current_total_loss:.4f}, LM Loss: {current_lm_loss:.4f}, KL Loss: {current_kl_loss:.6f}, Mse Loss:{current_mse_loss:.6f}")
 
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"  Current LR: {current_lr:.6f}")
-
-        fusion_net.train()  # 记得切换回 train 模式
-
-        #=================save per 5 epoch============
-        if (epoch + 1) % 5 == 0:
-            ckpt_path = os.path.join(checkpoint_dir, f"{epoch}_f1_{avg_metrics['f1']}.pt")
-            torch.save({
-                'fusion_net_state_dict': fusion_net.state_dict(),
-                'projector_state_dict': projector.state_dict()
-            }, ckpt_path)
-            print(f"✓ Saved checkpoint: {ckpt_path}")
-        #=================save_best===================
-        if avg_metrics['f1'] > best_f1:
-            best_f1 = avg_metrics['f1']
-            best_epoch = epoch
-            best_path = os.path.join(checkpoint_dir, "best_model.pt")
-            torch.save({
-                'fusion_net_state_dict': fusion_net.state_dict(),
-                'projector_state_dict': projector.state_dict()
-            }, best_path)
-            print(f"🌟 Saved best model (F1={best_f1:.4f}): {best_path}")
-        #==================save_history================
-        history_path = os.path.join(checkpoint_dir, "training_history.json")
-        with open(history_path, 'w') as f:
-            json.dump({
-                'history': history,
-                'best_epoch': best_epoch,
-                'best_f1': best_f1,
-                'args': vars(args)
-            }, f, indent=4)
-    
+    if args.joint_training:
+    # 联合训练：保存fusion_net和projector的权重
+        torch.save({
+            'fusion_net_state_dict': fusion_net.state_dict(),
+            'projector_state_dict': projector.state_dict(),
+        }, os.path.join(checkpoint_dir, f"joint_fusion_projector.pt"))
+        print(f"✓ Saved joint fusion-projector checkpoint: joint_fusion_projector.pt")
+    else:
+    # 非联合训练：只保存fusion_net的权重（projector固定）
+        torch.save({
+            'fusion_net_state_dict': fusion_net.state_dict(),
+        }, os.path.join(checkpoint_dir, f"fusion_1207.pt"))
+        print(f"✓ Saved fusion-only checkpoint: fusion.pt")
     print(f"\n{'='*60}")
     print(f"Training finished!")
-    print(f"Best Epoch: {best_epoch} (F1={best_f1:.4f})")
     print(f"Checkpoint dir: {checkpoint_dir}")
     print(f"{'='*60}")
 
@@ -501,7 +508,7 @@ if __name__ == "__main__":
     parser.add_argument("--inference_epoch", type=int, required=True)
     parser.add_argument("--projector_path", type=str, required=True)
     parser.add_argument("--augment_model", type=str, default=None)
-    parser.add_argument("--joint_training", type=bool, default=True, help="Whether to train projector jointly")
+    parser.add_argument("--joint_training", action="store_true", default=False, help="Whether to train projector jointly")
     args = parser.parse_args()
     
     assert args.lora_rank and args.lora_alpha, "No Config for LoRA"
